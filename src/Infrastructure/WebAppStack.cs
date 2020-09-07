@@ -1,24 +1,22 @@
-using System.Collections.Generic;
 using System.IO;
 using Pulumi;
 using Pulumi.Azure.AppService;
 using Pulumi.Azure.AppService.Inputs;
+using Pulumi.Azure.Authorization;
 using Pulumi.Azure.Core;
 using Pulumi.Azure.KeyVault;
-using Pulumi.Azure.KeyVault.Inputs;
-using Pulumi.Azure.Authorization;
 using Pulumi.Azure.Storage;
 
-class MyStack : Stack
+class WebAppStack : Stack
 {
-    public MyStack()
+    public WebAppStack()
     {
         var resourceGroup = new ResourceGroup("rg-easy-azure-webapp");
 
         var clientConfig = Output.Create(GetClientConfig.InvokeAsync());
 
         var tenantId = clientConfig.Apply(config => config.TenantId);
-        var objectId = clientConfig.Apply(config => config.ObjectId);
+        var currentPrincipal = clientConfig.Apply(config => config.ObjectId);
 
         var solutionRoot = System.Environment.GetEnvironmentVariable("SOLUTION_ROOT_DIRECTORY");
 
@@ -49,12 +47,15 @@ class MyStack : Stack
             ResourceGroupName = resourceGroup.Name,
             SkuName = "standard",
             TenantId = tenantId,
-            AccessPolicies = new KeyVaultAccessPolicyArgs
-            {
-                TenantId = tenantId,
-                ObjectId = objectId,
-                SecretPermissions = new[] { "delete", "get", "list", "set" }, 
-            },
+            SoftDeleteEnabled = true,
+        });
+
+        var keyVaultPolicy = new AccessPolicy("key-vault-policy", new AccessPolicyArgs
+        {
+            KeyVaultId = keyVault.Id,
+            TenantId = tenantId,
+            ObjectId = currentPrincipal,
+            SecretPermissions = new[] { "delete", "get", "list", "set" },
         });
 
         var codeBlobSecret = new Secret("zip-secret", new SecretArgs
@@ -62,7 +63,9 @@ class MyStack : Stack
             KeyVaultId = keyVault.Id,
             Value = SharedAccessSignature.SignedBlobReadUrl(codeBlob, storageAccount),
         });
-        var codeBlobSecretUrl = $"{keyVault.VaultUri}secrets/${codeBlobSecret.Name}/{codeBlobSecret.Version}";
+
+        var codeBlobSecretUrl = Output.All(keyVault.VaultUri, codeBlobSecret.Name, codeBlobSecret.Version)
+            .Apply(d => $"{d[0]}secrets/{d[1]}/{d[2]}");
 
         var appServicePlan = new Plan("easy-azure-webapp-plan", new PlanArgs
         {
@@ -83,9 +86,9 @@ class MyStack : Stack
             {
                 Type = "SystemAssigned",
             },
-            AppSettings = new Dictionary<string, string>
+            AppSettings = new InputMap<string>
             {
-                { "WEBSITE_RUN_FROM_ZIP", $"@Microsoft.KeyVault(SecretUri={codeBlobSecretUrl})" },
+                { "WEBSITE_RUN_FROM_ZIP", codeBlobSecretUrl.Apply(url => $"@Microsoft.KeyVault(SecretUri={url})") },
             }
         });
 
@@ -97,7 +100,7 @@ class MyStack : Stack
             },
             new CustomResourceOptions
             {
-                DependsOn = appService
+                DependsOn = appService,
             }
         );
 
@@ -107,15 +110,27 @@ class MyStack : Stack
         {
             KeyVaultId = keyVault.Id,
             TenantId = tenantId,
-            ObjectId = objectId,
+            ObjectId = principalId,
             SecretPermissions = "get",
         });
 
+        var subscriptionOutput = Output.Create(GetSubscription.InvokeAsync());
+        var scope = Output.All(
+            subscriptionOutput.Apply(s => s.SubscriptionId),
+            resourceGroup.Name,
+            storageAccount.Name,
+            storageContainer.Name
+        ).Apply(s => $"/subscriptions/{s[0]}/resourcegroups/{s[1]}/providers/Microsoft.Storage/storageAccounts/{s[2]}/blobServices/default/containers/{s[3]}");
+        
         var codeBlobPermission = new Assignment("read-code-blob", new AssignmentArgs
         {
             PrincipalId = principalId!,
-            Scope = Output.Create(GetSubscription.InvokeAsync()).Apply(s => $"/subscriptions/{s.SubscriptionId}/resourcegroups/{resourceGroup.Name}/providers/Microsoft.Storage/storageAccounts/{storageAccount.Name}/blobServices/default/containers/{storageContainer.Name}"),
+            Scope = scope,
             RoleDefinitionName = "Storage Blob Data Reader",
+        },
+        new CustomResourceOptions
+        {
+            DependsOn = new Resource[] { appServiceGet, policy, storageContainer },
         });
 
         WebAppUrl = appService.DefaultSiteHostname.Apply(url => $"https://{url}");
